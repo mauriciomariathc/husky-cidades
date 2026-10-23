@@ -3,7 +3,8 @@
 
 Entrada: as vias do OpenStreetMap (arquivo .osm.pbf ou .osm) e a lista de municípios do IBGE
 com coordenadas. Saída, na pasta indicada:
-  c/<codigo_ibge>.json  ruas do município (coordenadas em metros a partir do centro)
+  c/<codigo_ibge>.json  ruas do município (coordenadas em metros a partir do centro) e,
+                        quando houver, lagos, represas e rios largos ("w")
   indice.json           lista de municípios, usada para achar a cidade e para a busca
   _headers              cabeçalhos do Cloudflare Pages (CORS e cache)
 
@@ -60,6 +61,7 @@ def ler_municipios(caminho_municipios, caminho_estados):
                 'mx': 111_320.0 * math.cos(math.radians(lat)),
                 'nos': {},
                 'arestas': [],
+                'agua': [],
             })
     return cidades
 
@@ -125,6 +127,116 @@ class Leitor(osmium.SimpleHandler):
                         usada = True
         if usada:
             self.uteis += 1
+
+
+TIPOS_AGUA = {('natural', 'water'), ('waterway', 'riverbank'), ('landuse', 'reservoir')}
+PASSO_AGUA = 0.00012   # graus (~13 m): pontos mais próximos que isso são descartados
+AREA_MINIMA = 3000     # m²: lagoas menores não aparecem
+
+
+def decimar(pontos, passo=PASSO_AGUA):
+    """Simplificação rápida: mantém um ponto só quando ele se afasta o bastante do último mantido."""
+    if len(pontos) < 4:
+        return pontos
+    saida = [pontos[0]]
+    for p in pontos[1:-1]:
+        q = saida[-1]
+        if abs(p[0] - q[0]) > passo or abs(p[1] - q[1]) > passo:
+            saida.append(p)
+    saida.append(pontos[-1])
+    return saida
+
+
+def recortar(anel, q):
+    """Sutherland-Hodgman: recorta um polígono no quadrado [-q, q] x [-q, q]."""
+    def passada(pts, dentro, cruzar):
+        saida = []
+        if not pts:
+            return saida
+        anterior = pts[-1]
+        for atual in pts:
+            if dentro(atual):
+                if not dentro(anterior):
+                    saida.append(cruzar(anterior, atual))
+                saida.append(atual)
+            elif dentro(anterior):
+                saida.append(cruzar(anterior, atual))
+            anterior = atual
+        return saida
+
+    def em_x(limite):
+        return lambda a, b: (limite, a[1] + (b[1] - a[1]) * (limite - a[0]) / ((b[0] - a[0]) or 1e-9))
+
+    def em_z(limite):
+        return lambda a, b: (a[0] + (b[0] - a[0]) * (limite - a[1]) / ((b[1] - a[1]) or 1e-9), limite)
+
+    pts = passada(anel, lambda p: p[0] >= -q, em_x(-q))
+    pts = passada(pts, lambda p: p[0] <= q, em_x(q))
+    pts = passada(pts, lambda p: p[1] >= -q, em_z(-q))
+    pts = passada(pts, lambda p: p[1] <= q, em_z(q))
+    return pts
+
+
+def area_poligono(pts):
+    return abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(pts, pts[1:] + pts[:1]))) / 2
+
+
+class LeitorAgua(osmium.SimpleHandler):
+    """Lagos, represas e rios largos: cada área é entregue, já recortada, aos municípios que ela toca."""
+
+    def __init__(self, cidades, grade):
+        super().__init__()
+        self.cidades = cidades
+        self.grade = grade
+        self.areas = 0
+        self.usadas = 0
+
+    def area(self, a):
+        if not any((k, a.tags.get(k)) in TIPOS_AGUA for k in ('natural', 'waterway', 'landuse')):
+            return
+        try:
+            aneis = []
+            for externo in a.outer_rings():
+                pts = [(n.location.lat, n.location.lon) for n in externo]
+                internos = [[(n.location.lat, n.location.lon) for n in interno] for interno in a.inner_rings(externo)]
+                aneis.append((pts, internos))
+        except osmium.InvalidLocationError:
+            return
+        self.areas += 1
+        if self.areas % 100_000 == 0:
+            log(f'{self.areas:,} áreas de água lidas, {self.usadas:,} perto de algum município')
+        for pts, internos in aneis:
+            if len(pts) < 4:
+                continue
+            lats = [p[0] for p in pts]
+            lons = [p[1] for p in pts]
+            margem = 0.045
+            candidatas = set()
+            for gi in range(math.floor((min(lats) - margem) / GRADE), math.floor((max(lats) + margem) / GRADE) + 1):
+                for gj in range(math.floor((min(lons) - margem) / GRADE), math.floor((max(lons) + margem) / GRADE) + 1):
+                    candidatas.update(self.grade.get((gi, gj), ()))
+            if not candidatas:
+                continue
+            externo = decimar(pts)
+            internos = [decimar(i) for i in internos if len(i) >= 4]
+            for k in candidatas:
+                c = self.cidades[k]
+                q = RAIO_CAPITAL + 300
+                if (max(lats) - c['lat']) * c['my'] < -q or (min(lats) - c['lat']) * c['my'] > q:
+                    continue
+                if (max(lons) - c['lon']) * c['mx'] < -q or (min(lons) - c['lon']) * c['mx'] > q:
+                    continue
+                para_metros = lambda anel: [((lon - c['lon']) * c['mx'], -(lat - c['lat']) * c['my']) for lat, lon in anel]
+                fora = recortar(para_metros(externo), q)
+                if len(fora) < 3 or area_poligono(fora) < AREA_MINIMA:
+                    continue
+                buracos = []
+                for interno in internos:
+                    b = recortar(para_metros(interno), q)
+                    if len(b) >= 3 and area_poligono(b) >= AREA_MINIMA / 3:
+                        buracos.append(b)
+                c['agua'].append([fora] + buracos)
+                self.usadas += 1
 
 
 def maior_componente(nos, arestas):
@@ -229,6 +341,14 @@ def gravar_cidade(c, pasta):
         classes.append(str(k))
     if len(usados) < MIN_NOS:
         return 0
+    agua = []
+    q = raio + 250
+    for poligono in c.get('agua', []):
+        fora = recortar(poligono[0], q)
+        if len(fora) < 3 or area_poligono(fora) < AREA_MINIMA:
+            continue
+        aneis = [fora] + [b for b in (recortar(i, q) for i in poligono[1:]) if len(b) >= 3]
+        agua.append([[v for p in anel for v in (round(p[0]), round(p[1]))] for anel in aneis])
     dados = {
         'v': 1,
         'ibge': c['ibge'],
@@ -239,6 +359,8 @@ def gravar_cidade(c, pasta):
         'e': lista_arestas,
         'k': ''.join(classes),
     }
+    if agua:
+        dados['w'] = agua
     with open(os.path.join(pasta, 'c', f"{c['ibge']}.json"), 'w', encoding='utf-8') as f:
         json.dump(dados, f, ensure_ascii=False, separators=(',', ':'))
     return len(usados)
@@ -247,6 +369,7 @@ def gravar_cidade(c, pasta):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--vias', required=True)
+    p.add_argument('--agua', help='lagos, represas e rios largos (osm.pbf); opcional')
     p.add_argument('--municipios', required=True)
     p.add_argument('--estados', required=True)
     p.add_argument('--saida', default='saida')
@@ -259,6 +382,10 @@ def main():
     leitor = Leitor(cidades, montar_grade(cidades))
     leitor.apply_file(args.vias, locations=True, idx='flex_mem')
     log(f'{leitor.vias:,} vias lidas no total, {leitor.uteis:,} perto de algum município')
+    if args.agua:
+        leitor_agua = LeitorAgua(cidades, montar_grade(cidades))
+        leitor_agua.apply_file(args.agua, locations=True, idx='flex_mem')
+        log(f'{leitor_agua.areas:,} áreas de água lidas, {leitor_agua.usadas:,} trechos entregues a municípios')
 
     indice = []
     com_ruas = 0
@@ -269,6 +396,7 @@ def main():
         indice.append([c['ibge'], c['nome'], c['uf'], round(c['lat'], 4), round(c['lon'], 4), qtd])
         c['nos'] = {}
         c['arestas'] = []
+        c['agua'] = []
         if (k + 1) % 500 == 0:
             log(f'{k + 1} municípios gravados')
     indice.sort(key=lambda m: m[1])
@@ -276,7 +404,8 @@ def main():
         json.dump({'v': 1, 'fonte': '© colaboradores do OpenStreetMap (ODbL)', 'municipios': indice}, f, ensure_ascii=False, separators=(',', ':'))
     with open(os.path.join(args.saida, '_headers'), 'w', encoding='utf-8') as f:
         f.write('/*\n  Access-Control-Allow-Origin: *\n  Cache-Control: public, max-age=604800\n')
-    log(f'Pronto: {com_ruas} de {len(cidades)} municípios com ruas suficientes')
+    com_agua = sum(1 for m in indice if m[5] and os.path.exists(os.path.join(args.saida, 'c', f'{m[0]}.json')) and '"w":' in open(os.path.join(args.saida, 'c', f'{m[0]}.json'), encoding='utf-8').read())
+    log(f'Pronto: {com_ruas} de {len(cidades)} municípios com ruas suficientes; {com_agua} com água')
     if com_ruas < len(cidades) * args.minimo:
         log('Atenção: menos da metade dos municípios teve ruas. Confira o arquivo de vias.')
         sys.exit(1)
