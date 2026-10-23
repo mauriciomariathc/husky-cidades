@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   gerar:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
       - name: Baixar este repositório
@@ -49,6 +49,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      - name: Limitar a função às rotas /api (os arquivos das cidades continuam estáticos e gratuitos)
+        run: echo '{"version":1,"include":["/api/*"],"exclude":[]}' > saida/_routes.json
 
       - name: Publicar no Cloudflare Pages
         env:
