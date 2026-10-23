@@ -31,11 +31,12 @@ jobs:
           curl -L --fail --retry 3 -o brasil.osm.pbf https://download.geofabrik.de/south-america/brazil-latest.osm.pbf
           ls -lh brasil.osm.pbf
 
-      - name: Separar só as ruas
+      - name: Separar as ruas e a água
         run: |
           osmium tags-filter brasil.osm.pbf w/highway=motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,road,motorway_link,trunk_link,primary_link,secondary_link,tertiary_link -o vias.osm.pbf --overwrite
+          osmium tags-filter brasil.osm.pbf a/natural=water a/waterway=riverbank a/landuse=reservoir -o agua.osm.pbf --overwrite
           rm brasil.osm.pbf
-          ls -lh vias.osm.pbf
+          ls -lh vias.osm.pbf agua.osm.pbf
 
       - name: Baixar a lista de municípios (IBGE)
         run: |
@@ -43,7 +44,7 @@ jobs:
           curl -L --fail -o estados.csv https://raw.githubusercontent.com/kelvins/municipios-brasileiros/main/csv/estados.csv
 
       - name: Gerar um arquivo por município
-        run: python gerar_cidades.py --vias vias.osm.pbf --municipios municipios.csv --estados estados.csv --saida saida
+        run: python gerar_cidades.py --vias vias.osm.pbf --agua agua.osm.pbf --municipios municipios.csv --estados estados.csv --saida saida
 
       - name: Preparar o Node
         uses: actions/setup-node@v4
